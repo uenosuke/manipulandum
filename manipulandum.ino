@@ -13,10 +13,11 @@
 #include "AMT203VPeach.h"
 #include "SDclass.h"
 #include "LCDclass.h"
-#include "Button.h"
 #include "Filter.h"
 
-#define RPM2PWM ( 128.0/300.0 )
+#define MAX_RPM ( 500.0 )
+#define RPM2PWM ( 102.0/MAX_RPM )
+#define GEAR_RATIO ( 60 )
 
 phaseCounter enc1(1);
 phaseCounter enc2(2);
@@ -30,7 +31,7 @@ Filter filterFx(INT_TIME);
 Filter filterFy(INT_TIME);
 
 // グローバル変数の設定
-coords tipPosi = {0.0, 0.0, 0.0};
+coords tipPosi, pre_tipPosi = {0.0, 0.0, 0.0};
 coords tipVel = {0.0, 0.0, 0.0};
 coords refVel, pre_refVel = {0.0, 0.0, 0.0};
 coords PA_mass = {20.0, 20.0, 0.0}; // パワーアシストの慣性項
@@ -39,12 +40,14 @@ coords rawF, fltrd_rawF, fltrd_localF, gF;
 double theta1, theta2;//関節角度
 double pre_theta1, pre_theta2;
 double theta1_0, theta2_0;// 初期関節角度
+double next_theta1, next_theta2;
 double act_omega1, act_omega2;
 double ref_omega1, ref_omega2;
 double ref_rpm1, ref_rpm2;
 int ref_pwm1, ref_pwm2;
 int encount1 = 0, encount2 = 0;
 int fxad_neutral, fyad_neutral; // 力センサのAD変換値の中立点
+bool corride = false;
 
 bool flag_10ms = false; // loop関数で10msごとにシリアルプリントできるようにするフラグ
 bool flag_100ms = false;
@@ -94,8 +97,8 @@ void timer_warikomi(){
   encount1 = enc1.getCount();
   encount2 = enc2.getCount();
 
-  theta1 = -(theta1_0 + encount1) / (4096.0 * PI); // encountをもとに現在の角度を計算(回転方向に合わせてマイナス付けた)
-  theta2 = -(theta2_0 + encount2) / (4096.0 * 2.0 * PI); // 肘関節はセンサ直結(回転方向に合わせてマイナス付けた)
+  theta1 = theta1_0 - (double)encount1 / 4096.0 * PI; // encountをもとに現在の角度を計算(回転方向に合わせてマイナス付けた)
+  theta2 = theta2_0 - (double)encount2 / 4096.0 * 2.0 * PI; // 肘関節はセンサ直結(回転方向に合わせてマイナス付けた)
 
   C1 = cos(theta1);
   C2 = cos(theta2);
@@ -107,14 +110,14 @@ void timer_warikomi(){
   tipPosi.x =  L_ARM * (C1 + C12);
   tipPosi.y =  L_ARM * (S1 + S12);
 
+  tipVel.x = (tipPosi.x - pre_tipPosi.x) / INT_TIME;
+  tipVel.y = (tipPosi.y - pre_tipPosi.y) / INT_TIME;
+
   act_omega1 = (theta1 - pre_theta1) / INT_TIME; // 各関節の角速度を計算
   act_omega2 = (theta2 - pre_theta2) / INT_TIME;
 
-  tipVel.x = - L_ARM * ((S1 + S12)*act_omega1 + S12 * act_omega2);
-  tipVel.x =   L_ARM * ((C1 + C12)*act_omega1 + C12 * act_omega2);
-
-  rawF.x = (analogRead(PIN_FX) - fxad_neutral) * 0.02442; //200 / 2047.5; // 力は0~3.3Vを12ビットに変換されて取得できる
-  rawF.y = (analogRead(PIN_FY) - fyad_neutral) * 0.02442; // 力は±200N
+  rawF.x = (analogRead(PIN_FX) - fxad_neutral) * 0.0814; //  仕様書の0.015V/N より *5.0v/4095 / 0.015 にて算出
+  rawF.y = (analogRead(PIN_FY) - fyad_neutral) * 0.0814; // 力は±200N
   fltrd_rawF.x = filterFx.LowPassFilter(rawF.x); // センサの生データをフィルターにかける（ノイズ除去）
   fltrd_rawF.y = filterFy.LowPassFilter(rawF.y);
   //fltrd_localF.x = (-fltrd_rawF.x + fltrd_rawF.x) / 1.41421356; // 力をアームの座標系に合わせて変換する
@@ -127,25 +130,35 @@ void timer_warikomi(){
 
   refVel.x = (PA_K.x * INT_TIME * gF.x + PA_T.x * pre_refVel.x)/(PA_T.x + INT_TIME);
   refVel.y = (PA_K.y * INT_TIME * gF.y + PA_T.y * pre_refVel.y)/(PA_T.y + INT_TIME);
+  //refVel.x = 0.0;
+  //refVel.y = 0.1;
 
   ref_omega1 =  (C12 * refVel.x + S12 * refVel.y)/(L_ARM * S2);
-  ref_omega2 = -(-(C1 + C12) * refVel.x + (S1 + S12) * refVel.y)/(L_ARM * S2); //回転方向に合わせてマイナス付けた
+  //ref_omega2 =  -(-(C1 + C12) * refVel.x - (S1 + S12) * refVel.y)/(L_ARM * S2); //回転方向に合わせてマイナス付けた
+  ref_omega2 =  -(-C1 * refVel.x - S1 * refVel.y)/(L_ARM * S2); // モータがリンクの根元に付いていることを考慮し，omega2'=omega2+omega1で導出
 
-  ref_rpm1 = ref_omega1 * 30 / PI; // 60/2PI だけど，30/PIで
-  ref_rpm2 = ref_omega2 * 30 / PI;
+  ref_rpm1 = ref_omega1 * GEAR_RATIO * 30 / PI; // 60/2PI だけど，30/PIで
+  ref_rpm2 = ref_omega2 * GEAR_RATIO * 30 / PI;
 
-  ref_pwm1 = ref_rpm1 * RPM2PWM + 128;
-  ref_pwm2 = ref_rpm2 * RPM2PWM + 128;
+  if(( theta1 >= 1.9 || (theta1 + theta2) <= -1.9 ) || ((theta2 >= -0.25) || (theta2 <= -2.85))){
+    corride = true;
+    ref_rpm1 = 0;
+    ref_rpm2 = 0;
+  }else corride = false;
+  
+  if(ref_rpm1 < -MAX_RPM) ref_rpm1 = -MAX_RPM;
+  if(ref_rpm1 > MAX_RPM) ref_rpm1 = MAX_RPM;
+  if(ref_rpm2 < -MAX_RPM) ref_rpm2 = -MAX_RPM;
+  if(ref_rpm2 > MAX_RPM) ref_rpm2 = MAX_RPM;
 
-  if(ref_pwm1 < 0) ref_pwm1 = 0;
-  if(ref_pwm1 > 255) ref_pwm1 = 255;
-  if(ref_pwm2 < 0) ref_pwm2 = 0;
-  if(ref_pwm2 > 255) ref_pwm2 = 255;
+  ref_pwm1 = (int)(ref_rpm1 * RPM2PWM) + 128;
+  ref_pwm2 = (int)(ref_rpm2 * RPM2PWM) + 128;
 
   analogWrite(PIN_ESCON1_PWM, ref_pwm1);
   analogWrite(PIN_ESCON2_PWM, ref_pwm2);
 
   pre_refVel = refVel;
+  pre_tipPosi = tipPosi;
   pre_theta1 = theta1;
   pre_theta2 = theta2;
 
@@ -227,8 +240,13 @@ void setup()
   enc2.init();
   int absencount1 = absenc1.getEncount();
   int absencount2 = absenc2.getEncount(); 
-  theta1 = pre_theta1 = theta1_0 = (double)absencount1 / (4096) * PI;	// 角度に変換
-  theta2 = pre_theta2 = theta2_0 = (double)absencount2 / (4096) * PI;	// 角度に変換
+  if(absencount1 > 2047){
+    theta1 = pre_theta1 = theta1_0 = (double)(4095 - absencount1) / (4096.0) * PI;	// 角度に変換
+  }else{
+    theta1 = pre_theta1 = theta1_0 = -(double)(absencount1) / (4096.0) * PI;	// 角度に変換
+  }
+  
+  theta2 = pre_theta2 = theta2_0 = -(double)absencount2 / (4096.0) * 2 * PI;	// 角度に変換
 
   Serial.println("initial count");
   Serial.print(absencount1);
@@ -253,9 +271,9 @@ void setup()
   }
 
   fxad_neutral = analogRead(PIN_FX);
-  filterFx.setLowPassPara(0.02, 0.0); // ローパスフィルタ(ノイズ除去用)を初期化
+  filterFx.setLowPassPara(0.05, 0.0); // ローパスフィルタ(ノイズ除去用)を初期化
   fyad_neutral = analogRead(PIN_FY);
-  filterFy.setLowPassPara(0.02, 0.0);
+  filterFy.setLowPassPara(0.05, 0.0);
   LEDblink(PIN_LED_RED, 2, 100);
 
   /*myLCD.clear_display();
@@ -319,17 +337,33 @@ void loop()
 
     mySD.write_logdata(dataString);*/
 
-    Serial.print(theta1_0);
+    Serial.print(gF.x);
     Serial.print("\t");
-    Serial.print(theta2_0);
+    Serial.print(gF.y);
     Serial.print("\t");
-    Serial.print(rawF.x);
+    Serial.print(refVel.x);
     Serial.print("\t");
-    Serial.print(rawF.y);
+    Serial.print(refVel.y);
     Serial.print("\t");
-    Serial.print(fltrd_localF.x);
+    Serial.print(tipVel.x);
     Serial.print("\t");
-    Serial.println(fltrd_localF.y);
+    Serial.print(tipVel.y);
+    Serial.print("\t");
+    Serial.print(ref_rpm1);
+    Serial.print("\t");
+    Serial.print(ref_rpm2);
+    Serial.print("\t");
+    Serial.println(corride);
+
+    /*Serial.print(tipVel.x);
+    Serial.print("\t");
+    Serial.print(tipVel.y);
+    Serial.print("\t");
+    Serial.print(tipPosi.x);
+    Serial.print("\t");
+    Serial.print(tipPosi.y);
+    Serial.print("\t");
+    Serial.println(corride);*/
 
     
     /*Serial.print(analogRead(A0));
