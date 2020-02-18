@@ -14,6 +14,9 @@
 #include "SDclass.h"
 #include "LCDclass.h"
 #include "Button.h"
+#include "Filter.h"
+
+#define RPM2PWM ( 128.0/300.0 )
 
 phaseCounter enc1(1);
 phaseCounter enc2(2);
@@ -23,32 +26,28 @@ AMT203V absenc2(&SPI, PIN_CSB2);
 mySDclass mySD;
 myLCDclass myLCD(&SERIAL_LCD);
 
-/*Button button_up(PIN_SW_UP);
-Button button_down(PIN_SW_DOWN);
-Button button_left(PIN_SW_LEFT);
-Button button_right(PIN_SW_RIGHT);
-Button button_B(PIN_SW_A);
-Button button_A(PIN_SW_B);
-Button dip1(PIN_DIP1);
-Button dip2(PIN_DIP2);
-Button dip3(PIN_DIP3);
-Button dip4(PIN_DIP4);*/
+Filter filterFx(INT_TIME);
+Filter filterFy(INT_TIME);
 
 // グローバル変数の設定
-coords gPosi = {0.0, 0.0, 0.0};
-double theta1, theta2;
+coords tipPosi = {0.0, 0.0, 0.0};
+coords tipVel = {0.0, 0.0, 0.0};
+coords refVel, pre_refVel = {0.0, 0.0, 0.0};
+coords PA_mass = {20.0, 20.0, 0.0}; // パワーアシストの慣性項
+coords PA_viscos = {30.0, 30.0, 0.0}; // パワーアシストの粘性項
+coords rawF, fltrd_rawF, fltrd_localF, gF;
+double theta1, theta2;//関節角度
+double pre_theta1, pre_theta2;
+double theta1_0, theta2_0;// 初期関節角度
+double act_omega1, act_omega2;
+double ref_omega1, ref_omega2;
+double ref_rpm1, ref_rpm2;
+int ref_pwm1, ref_pwm2;
 int encount1 = 0, encount2 = 0;
+int fxad_neutral, fyad_neutral; // 力センサのAD変換値の中立点
 
 bool flag_10ms = false; // loop関数で10msごとにシリアルプリントできるようにするフラグ
 bool flag_100ms = false;
-
-// 最大最小範囲に収まるようにする関数
-double min_max(double value, double minmax)
-{
-  if(value > minmax) value = minmax;
-  else if(value < -minmax) value = -minmax;
-  return value;
-}
 
 // LEDをチカチカさせるための関数
 void LEDblink(byte pin, int times, int interval){
@@ -89,16 +88,71 @@ void timer_warikomi(){
     count_flag = 0;
   }
 
-  double angle_rad;
+  double C1, C2, C12, S1, S2, S12;
   //int encount1, encount2; // X,Y軸エンコーダのカウント値
   // 自己位置推定用エンコーダのカウント値取得
   encount1 = enc1.getCount();
   encount2 = enc2.getCount();
 
-  int absencount1 = absenc1.getEncount();
-  int absencount2 = absenc2.getEncount(); 
-  theta1 = (double)absencount1 / (4096) * PI;	// 角度に変換
-  theta2 = (double)absencount2 / (4096) * PI;	// 角度に変換
+  theta1 = -(theta1_0 + encount1) / (4096.0 * PI); // encountをもとに現在の角度を計算(回転方向に合わせてマイナス付けた)
+  theta2 = -(theta2_0 + encount2) / (4096.0 * 2.0 * PI); // 肘関節はセンサ直結(回転方向に合わせてマイナス付けた)
+
+  C1 = cos(theta1);
+  C2 = cos(theta2);
+  C12 = cos(theta1 + theta2);
+  S1 = sin(theta1);
+  S2 = sin(theta2);
+  S12 = sin(theta1 + theta2);
+
+  tipPosi.x =  L_ARM * (C1 + C12);
+  tipPosi.y =  L_ARM * (S1 + S12);
+
+  act_omega1 = (theta1 - pre_theta1) / INT_TIME; // 各関節の角速度を計算
+  act_omega2 = (theta2 - pre_theta2) / INT_TIME;
+
+  tipVel.x = - L_ARM * ((S1 + S12)*act_omega1 + S12 * act_omega2);
+  tipVel.x =   L_ARM * ((C1 + C12)*act_omega1 + C12 * act_omega2);
+
+  rawF.x = (analogRead(PIN_FX) - fxad_neutral) * 0.02442; //200 / 2047.5; // 力は0~3.3Vを12ビットに変換されて取得できる
+  rawF.y = (analogRead(PIN_FY) - fyad_neutral) * 0.02442; // 力は±200N
+  fltrd_rawF.x = filterFx.LowPassFilter(rawF.x); // センサの生データをフィルターにかける（ノイズ除去）
+  fltrd_rawF.y = filterFy.LowPassFilter(rawF.y);
+  fltrd_localF.x = (-fltrd_rawF.x + fltrd_rawF.x) / 1.41421356; // 力をアームの座標系に合わせて変換する
+  fltrd_localF.y = (-fltrd_rawF.x - fltrd_rawF.x) / 1.41421356;
+  gF.x = fltrd_localF.x * C1 - fltrd_localF.y * S1; // 力を，マニピュランダムのグローバル座標系に変換
+  gF.y = fltrd_localF.x * S1 + fltrd_localF.y * C1;
+
+  coords PA_K = {1.0/PA_viscos.x, 1.0/PA_viscos.y, 0.0};
+  coords PA_T = {PA_mass.x/PA_viscos.x, PA_mass.y/PA_viscos.y, 0.0};
+
+  refVel.x = (PA_K.x * INT_TIME * gF.x + PA_T.x * pre_refVel.x)/(PA_T.x + INT_TIME);
+  refVel.y = (PA_K.y * INT_TIME * gF.y + PA_T.y * pre_refVel.y)/(PA_T.y + INT_TIME);
+
+  ref_omega1 =  (C12 * refVel.x + S12 * refVel.y)/(L_ARM * S2);
+  ref_omega2 = -(-(C1 + C12) * refVel.x + (S1 + S12) * refVel.y)/(L_ARM * S2); //回転方向に合わせてマイナス付けた
+
+  ref_rpm1 = ref_omega1 * 30 / PI; // 60/2PI だけど，30/PIで
+  ref_rpm2 = ref_omega2 * 30 / PI;
+
+  ref_pwm1 = ref_rpm1 * RPM2PWM + 128;
+  ref_pwm2 = ref_rpm2 * RPM2PWM + 128;
+
+  if(ref_pwm1 < 0) ref_pwm1 = 0;
+  if(ref_pwm1 > 255) ref_pwm1 = 255;
+  if(ref_pwm2 < 0) ref_pwm2 = 0;
+  if(ref_pwm2 > 255) ref_pwm2 = 255;
+
+  analogWrite(PIN_ESCON1_PWM, ref_pwm1);
+  analogWrite(PIN_ESCON2_PWM, ref_pwm2);
+
+  pre_refVel = refVel;
+  pre_theta1 = theta1;
+  pre_theta2 = theta2;
+
+  //int absencount1 = absenc1.getEncount();
+  //int absencount2 = absenc2.getEncount(); 
+  //theta1 = (double)absencount1 / (4096) * PI;	// 角度に変換
+  //theta2 = (double)absencount2 / (4096) * PI;	// 角度に変換
   
 }
 
@@ -173,8 +227,8 @@ void setup()
   enc2.init();
   int absencount1 = absenc1.getEncount();
   int absencount2 = absenc2.getEncount(); 
-  theta1 = (double)absencount1 / (4096) * PI;	// 角度に変換
-  theta2 = (double)absencount2 / (4096) * PI;	// 角度に変換
+  theta1 = pre_theta1 = theta1_0 = (double)absencount1 / (4096) * PI;	// 角度に変換
+  theta2 = pre_theta2 = theta2_0 = (double)absencount2 / (4096) * PI;	// 角度に変換
 
   Serial.println("initial count");
   Serial.print(absencount1);
@@ -193,10 +247,16 @@ void setup()
   //mySD.make_logfile();
   //LEDblink(PIN_LED_RED, 2, 100);
 
-  // コントローラの"A"ボタンが押されるまで待機
+  // ボード上の"A"ボタンが押されるまで待機
   while(digitalRead(PIN_SW_A)){
     delay(10);
   }
+
+  fxad_neutral = analogRead(PIN_FX);
+  filterFx.setLowPassPara(0.02, 0.0); // ローパスフィルタ(ノイズ除去用)を初期化
+  fyad_neutral = analogRead(PIN_FY);
+  filterFy.setLowPassPara(0.02, 0.0);s
+  LEDblink(PIN_LED_RED, 2, 100);
 
   /*myLCD.clear_display();
   myLCD.write_line("# Program Started  #", LINE_1);
