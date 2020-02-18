@@ -117,10 +117,10 @@ void timer_warikomi(){
   rawF.y = (analogRead(PIN_FY) - fyad_neutral) * 0.02442; // 力は±200N
   fltrd_rawF.x = filterFx.LowPassFilter(rawF.x); // センサの生データをフィルターにかける（ノイズ除去）
   fltrd_rawF.y = filterFy.LowPassFilter(rawF.y);
-  fltrd_localF.x = (-fltrd_rawF.x + fltrd_rawF.x) / 1.41421356; // 力をアームの座標系に合わせて変換する
-  fltrd_localF.y = (-fltrd_rawF.x - fltrd_rawF.x) / 1.41421356;
-  gF.x = fltrd_localF.x * C1 - fltrd_localF.y * S1; // 力を，マニピュランダムのグローバル座標系に変換
-  gF.y = fltrd_localF.x * S1 + fltrd_localF.y * C1;
+  //fltrd_localF.x = (-fltrd_rawF.x + fltrd_rawF.x) / 1.41421356; // 力をアームの座標系に合わせて変換する
+  //fltrd_localF.y = (-fltrd_rawF.x - fltrd_rawF.x) / 1.41421356;
+  gF.x = fltrd_rawF.x * C1 - fltrd_rawF.y * S1; // 力を，マニピュランダムのグローバル座標系に変換
+  gF.y = fltrd_rawF.x * S1 + fltrd_rawF.y * C1;
 
   coords PA_K = {1.0/PA_viscos.x, 1.0/PA_viscos.y, 0.0};
   coords PA_T = {PA_mass.x/PA_viscos.x, PA_mass.y/PA_viscos.y, 0.0};
@@ -255,7 +255,7 @@ void setup()
   fxad_neutral = analogRead(PIN_FX);
   filterFx.setLowPassPara(0.02, 0.0); // ローパスフィルタ(ノイズ除去用)を初期化
   fyad_neutral = analogRead(PIN_FY);
-  filterFy.setLowPassPara(0.02, 0.0);s
+  filterFy.setLowPassPara(0.02, 0.0);
   LEDblink(PIN_LED_RED, 2, 100);
 
   /*myLCD.clear_display();
@@ -319,13 +319,19 @@ void loop()
 
     mySD.write_logdata(dataString);*/
 
-    Serial.print(theta1);
-    Serial.print(" ");
-    Serial.print(theta2);
-    Serial.print(" ");
-    Serial.print(absenc1.getEncount());
-    Serial.print(" ");
-    Serial.println(absenc2.getEncount());
+    Serial.print(theta1_0);
+    Serial.print("\t");
+    Serial.print(theta2_0);
+    Serial.print("\t");
+    Serial.print(rawF.x);
+    Serial.print("\t");
+    Serial.print(rawF.y);
+    Serial.print("\t");
+    Serial.print(fltrd_localF.x);
+    Serial.print("\t");
+    Serial.println(fltrd_localF.y);
+
+    
     /*Serial.print(analogRead(A0));
     Serial.print(" ");
     Serial.print(analogRead(A1));
